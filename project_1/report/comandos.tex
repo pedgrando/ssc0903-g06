@@ -1,0 +1,68 @@
+%Comando de tamanho do título.
+\newcommand\titlesize{\fontsize{14}{1.5\baselineskip}\selectfont}
+
+%Comando de tamanho do texto.
+\newcommand\textsize{\fontsize{12}{1\baselineskip}\selectfont}
+
+\newcommand{\newl}{\vspace{\baselineskip}}
+\newcommand{\p}{\hspace{1.5em}}
+
+%Muda o tamanho dos títulos.
+\titleformat{\section}{\titlesize\bfseries}{\thesection}{1em}{}
+
+\newcounter{questao}
+\setcounter{questao}{1}
+\newenvironment{myenum}
+{
+    \begin{enumerate}[leftmargin = *, label=\textbf{\arabic*.}]
+    \setcounter{enumi}{\thequestao}
+    
+}
+{
+    \end{enumerate}
+    \setcounter{questao}{\theenumi}
+}
+
+\newenvironment{manualenum}[1][\theenumi]
+{
+    \begin{enumerate}[leftmargin = *, label=\textbf{\arabic*.}]
+    \setcounter{enumi}{#1}
+    \addtocounter{enumi}{-1}
+    
+}
+{
+    \end{enumerate}
+}
+
+% macros
+\newcommand{\ii}[1]{\textit{#1}}
+\newcommand{\bb}[1]{\textbf{#1}}
+\newcommand{\bbb}[1]{\boldsymbol{#1}}
+\newcommand{\bbm}[1]{$\boldsymbol{#1}$}
+\newcommand{\ttt}[1]{\texttt{#1}}
+\newcommand{\hh}[1]{\textcolor{red}{#1}}
+\newcommand{\hhh}[1]{\textcolor{green}{#1}}
+
+% lstlisting
+\renewcommand{\lstlistingname}{Código}
+\renewcommand{\lstlistlistingname}{Lista de Códigos}
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  stepnumber=1,
+  numbersep=5pt,
+  backgroundcolor=\color{white},
+  frame=single,
+  tabsize=2,
+  captionpos=b,
+  breaklines=true,
+  breakatwhitespace=false,
+  showspaces=false,
+  showstringspaces=false,
+  showtabs=false,
+  captionpos=t,
+  morekeywords={*,...} % Add keywords here
+}
+
+% identation
