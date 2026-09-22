@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -O3 -Wall -Wextra
+CFLAGS = -O2 -Wall -Wextra
 LIBS = -lm
 
 all: fire_seq fire_omp
