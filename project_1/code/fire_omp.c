@@ -530,14 +530,14 @@ static inline void transicao(int estado, int tempo, int cob, int umid,
  * ignicoes e celulas que apagaram nos contadores passados por referencia.
  */
 static inline void atualizar_celula_borda(int i, int j, int L, int C, int limiar,
-                                         const unsigned char *estado_arr,
-                                         const int *tempo_arr,
-                                         const unsigned char *cob_arr,
-                                         const unsigned char *umid_arr,
-                                         unsigned char *prox_estado,
-                                         int *prox_tempo,
-                                         long long *ignicoes,
-                                         long long *apagadas) {
+                                         const unsigned char *restrict estado_arr,
+                                         const int *restrict tempo_arr,
+                                         const unsigned char *restrict cob_arr,
+                                         const unsigned char *restrict umid_arr,
+                                         unsigned char *restrict prox_estado,
+                                         int *restrict prox_tempo,
+                                         long long *restrict ignicoes,
+                                         long long *restrict apagadas) {
     long long idx = (long long)i * C + j;
     int s = 0, n_estado, n_tempo;
 
@@ -703,9 +703,26 @@ int main(int argc, char *argv[]) {
                 }
 
                 const long long base = (long long)i * C;
+
+                /*
+                 * Hot path: keep each row as a set of independent streams.
+                 * This avoids repeatedly forming base+j addresses and makes
+                 * the memory access pattern explicit to the compiler.
+                 *
+                 * restrict is valid here because these arrays are distinct
+                 * allocations and the current/next buffers do not alias.
+                 */
                 const unsigned char *acima = estado_atual + base - C;
                 const unsigned char *meio  = estado_atual + base;
                 const unsigned char *abaixo = estado_atual + base + C;
+
+                const int *restrict tempo = tempo_atual + base;
+                const unsigned char *restrict cob = cobertura + base;
+                const unsigned char *restrict umid = umidade + base;
+
+                unsigned char *restrict prox_e = proximo_estado + base;
+                int *restrict prox_t = proximo_tempo + base;
+
                 int ign_linha = 0, apag_linha = 0;
 
                 /* Celulas internas sem checagem de bordas: vetorizacao SIMD */
@@ -714,15 +731,39 @@ int main(int argc, char *argv[]) {
                     const int s = p_no * (acima[j - 1] == 2)  + p_n * (acima[j] == 2)  + p_ne * (acima[j + 1] == 2)
                                 + p_o  * (meio[j - 1] == 2)                            + p_e  * (meio[j + 1] == 2)
                                 + p_so * (abaixo[j - 1] == 2) + p_s * (abaixo[j] == 2) + p_se * (abaixo[j + 1] == 2);
-                    int novo_estado, novo_tempo;
 
-                    transicao(meio[j], tempo_atual[base + j], cobertura[base + j], umidade[base + j],
-                              s, limiar, &novo_estado, &novo_tempo);
-                    proximo_estado[base + j] = (unsigned char)novo_estado;
-                    proximo_tempo[base + j] = novo_tempo;
-                    ign_linha += (meio[j] == 1) & (novo_estado == 2);
-                    apag_linha += (meio[j] == 2) & (novo_estado == 3);
+                    /*
+                     * Inline the transition in the SIMD kernel. This is
+                     * algebraically identical to transicao(), but exposes
+                     * the complete hot loop to the vectorizer.
+                     */
+                    const int estado = meio[j];
+                    const int tempo_j = tempo[j];
+                    const int cob_j = cob[j];
+                    const int umid_j = umid[j];
+
+                    const int fator_combustivel =
+                        8 * (cob_j == 2) + 12 * (cob_j == 3);
+                    const int potencial =
+                        (s * fator_combustivel * (100 - umid_j)) / 100;
+                    const int ignicao =
+                        (potencial >= limiar) & (estado == 1);
+                    const int queimando = (estado == 2);
+                    const int apagou = queimando & (tempo_j == 1);
+
+                    const int novo_estado =
+                        estado + ignicao + apagou;
+                    const int novo_tempo =
+                        tempo_j - queimando +
+                        ignicao * (2 + 2 * (cob_j == 3));
+
+                    prox_e[j] = (unsigned char)novo_estado;
+                    prox_t[j] = novo_tempo;
+
+                    ign_linha += (estado == 1) & (novo_estado == 2);
+                    apag_linha += (estado == 2) & (novo_estado == 3);
                 }
+
                 step_ignicoes += ign_linha;
                 step_apagadas += apag_linha;
             }
