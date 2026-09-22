@@ -4,14 +4,20 @@
 #include <math.h>
 
 #ifdef _WIN32
-// O Windows não tem rand_r, então criamos uma versão provisória 
-// que só existe se o código for compilado no Windows.
+// O Windows nao tem rand_r nativo, portanto definimos uma versao compativel
 int rand_r(unsigned int *seedp) {
     *seedp = *seedp * 1103515245 + 12345;
     return (unsigned int)(*seedp / 65536) % 32768;
 }
 #endif
 
+#ifndef SCHEDULE_OMP
+#define SCHEDULE_OMP static
+#endif
+
+/* ============================================================
+ * Tipos de dados e Estruturas
+ * ============================================================ */
 
 typedef struct {
     int linha;
@@ -34,8 +40,8 @@ typedef struct {
     unsigned int seed;      /* semente para rand_r */
     int LIMIAR;             /* limiar de ignicao */
 
-    int vento_linha;        /* componente vertical do vento */
-    int vento_coluna;       /* componente horizontal do vento */
+    int vento_linha;        /* componente vertical do vento (-1, 0, 1) */
+    int vento_coluna;       /* componente horizontal do vento (-1, 0, 1) */
     int intensidade_vento;  /* intensidade do vento (0 a 5) */
 
     int F;                  /* quantidade de focos iniciais */
@@ -44,6 +50,43 @@ typedef struct {
     Zona *zonas;            /* vetor de zonas */
 } Config;
 
+/* ============================================================
+ * Variaveis Globais de Estado da Simulacao
+ * ============================================================ */
+
+unsigned char *cobertura = NULL;       /* Tipo de cobertura de cada celula (0: Agua, 1: Solo, 2: Rasteira, 3: Floresta) */
+unsigned char *umidade = NULL;         /* Umidade de cada celula (0 a 100) */
+unsigned char *estado_atual = NULL;    /* Estado atual (0: Nao comb., 1: Intacta, 2: Chamas, 3: Queimada, 4: Contencao) */
+unsigned char *proximo_estado = NULL;  /* Estado futuro para o double-buffering */
+int *tempo_atual = NULL;               /* Tempo restante de queima de cada celula */
+int *proximo_tempo = NULL;             /* Tempo de queima futuro para o double-buffering */
+int *ativacao = NULL;                  /* Menor passo de ativacao da zona (-1 se nenhuma) */
+long long total_celulas = 0;           /* Total de celulas na grade (L * C) */
+
+/* Matriz estatica 3x3 de pesos direcionais dos vizinhos de Moore pre-computados */
+int pesos_vizinhos[3][3];
+
+/* Estatisticas finais da simulacao */
+int passos_executados = 0;
+long long nao_combustiveis = 0;
+long long intactas = 0;
+long long em_chamas = 0;
+long long queimadas = 0;
+long long contencao = 0;
+long long total_ignicoes = 0;
+int pico_ignicoes_passo = -1;
+int pico_ignicoes_qtd = 0;
+double percentual_queimado = 0.0;
+double percentual_protegido = 0.0;
+double tempo_de_execucao = 0.0;
+
+/* ============================================================
+ * compara_focos
+ * ============================================================
+ * Funcao de comparacao utilizada pelo qsort para ordenar focos
+ * por coordenadas (linha, coluna), facilitando a deteccao de
+ * focos repetidos na validacao de entrada.
+ */
 static int compara_focos(const void *a, const void *b) {
     const Foco *fa = (const Foco *)a;
     const Foco *fb = (const Foco *)b;
@@ -57,7 +100,10 @@ static int compara_focos(const void *a, const void *b) {
 /* ============================================================
  * le_entrada
  * ============================================================
- * Le o arquivo de entrada e preenche a estrutura Config.
+ * Le o arquivo de configuracao da simulacao e valida todos os
+ * parametros conforme os requisitos da especificacao:
+ * dimensoes, passos, threads, limiar, direcao e intensidade do
+ * vento, focos dentro dos limites sem duplicatas, e zonas validas.
  * Retorna 0 em caso de sucesso e 1 em caso de erro.
  */
 int le_entrada(const char *caminho, Config *cfg) {
@@ -146,7 +192,7 @@ int le_entrada(const char *caminho, Config *cfg) {
             fclose(fp);
             return 1;
         }
-        
+
         for (int i = 0; i < F; i++) {
             if (fscanf(fp, "%d %d", &focos[i].linha, &focos[i].coluna) != 2) {
                 fprintf(stderr, "Erro: foco %d invalido\n", i + 1);
@@ -164,7 +210,7 @@ int le_entrada(const char *caminho, Config *cfg) {
             }
         }
 
-        /* Verifica focos repetidos apos ordenar por (linha, coluna). */
+        /* Verifica focos repetidos apos ordenar por (linha, coluna) */
         qsort(focos, F, sizeof(Foco), compara_focos);
         for (int i = 1; i < F; i++) {
             if (focos[i].linha == focos[i - 1].linha &&
@@ -230,19 +276,16 @@ int le_entrada(const char *caminho, Config *cfg) {
 
     /* --- Preenche a estrutura Config --- */
     cfg->L = L;
-    
     cfg->C = C;
     cfg->P = P;
     cfg->T = T;
     cfg->seed = seed;
-    
     cfg->LIMIAR = LIMIAR;
     cfg->vento_linha = vento_linha;
     cfg->vento_coluna = vento_coluna;
     cfg->intensidade_vento = intensidade;
     cfg->F = F;
     cfg->Z = Z;
-    
     cfg->focos = focos;
     cfg->zonas = zonas;
 
@@ -252,20 +295,21 @@ int le_entrada(const char *caminho, Config *cfg) {
 /* ============================================================
  * aplica_focos
  * ============================================================
- * Marca os focos iniciais como "em chamas" e define seus tempos
- * de queima. Verifica se cada foco esta sobre celula combustivel.
- * Retorna 0 em caso de sucesso e 1 em caso de erro.
+ * Aplica os focos iniciais de incendio na matriz de estados e
+ * define o tempo inicial de queima (2 para vegetacao rasteira e
+ * 4 para floresta). Valida se algum foco foi posicionado sobre
+ * celula nao combustivel (agua ou solo exposto).
+ * Retorna 0 em caso de sucesso e 1 se houver foco invalido.
  */
 int aplica_focos(const Config *cfg, int C,
-                 const unsigned char *cobertura,
-                 unsigned char *estado_atual,
-                 unsigned char *tempo_atual) {
-
+                 const unsigned char *cobertura_arr,
+                 unsigned char *estado_arr,
+                 int *tempo_arr) {
     for (int i = 0; i < cfg->F; i++) {
         int linha = cfg->focos[i].linha;
         int coluna = cfg->focos[i].coluna;
         long long idx = (long long)linha * C + coluna;
-        unsigned char cov = cobertura[idx];
+        unsigned char cov = cobertura_arr[idx];
 
         if (cov == 0 || cov == 1) {
             fprintf(stderr, "Erro: foco (%d, %d) esta sobre celula nao combustivel\n",
@@ -273,8 +317,8 @@ int aplica_focos(const Config *cfg, int C,
             return 1;
         }
 
-        estado_atual[idx] = 2;   /* em chamas */
-        tempo_atual[idx] = (cov == 2) ? 2 : 4;
+        estado_arr[idx] = 2;   /* em chamas */
+        tempo_arr[idx] = (cov == 2) ? 2 : 4;
     }
 
     return 0;
@@ -283,32 +327,30 @@ int aplica_focos(const Config *cfg, int C,
 /* ============================================================
  * constroi_mapa_ativacao
  * ============================================================
- * Preenche o vetor ativacao com o menor passo de ativacao de
- * cada celula pertencente a uma zona de contencao.
- * Retorna 0 em caso de sucesso e 1 em caso de erro.
+ * Mapeia cada celula para o menor passo de ativacao dentre todas
+ * as zonas de contencao que a recobrem. Celulas sem zona recebem -1.
+ * Retorna 0 em caso de sucesso.
  */
-int constroi_mapa_ativacao(const Config *cfg, int C, unsigned char *ativacao) {
-
+int constroi_mapa_ativacao(const Config *cfg, int C, int *ativacao_arr) {
     for (int z = 0; z < cfg->Z; z++) {
         int passo = cfg->zonas[z].passo;
         for (int l = cfg->zonas[z].l1; l <= cfg->zonas[z].l2; l++) {
             for (int c = cfg->zonas[z].c1; c <= cfg->zonas[z].c2; c++) {
                 long long idx = (long long)l * C + c;
-
-                if (ativacao[idx] == -1 || passo < ativacao[idx]) {
-                    ativacao[idx] = passo;
+                if (ativacao_arr[idx] == -1 || passo < ativacao_arr[idx]) {
+                    ativacao_arr[idx] = passo;
                 }
             }
         }
     }
-
     return 0;
 }
 
 /* ============================================================
  * libera_config
  * ============================================================
- * Libera a memoria alocada para focos e zonas.
+ * Libera a memoria alocada para os vetores de focos e zonas da
+ * estrutura de configuracao.
  */
 void libera_config(Config *cfg) {
     if (cfg->focos != NULL) {
@@ -321,63 +363,69 @@ void libera_config(Config *cfg) {
     }
 }
 
-unsigned char *cobertura, *umidade, *estado_atual, *proximo_estado; // char para ocupar menos memória
-unsigned char *tempo_atual, *proximo_tempo, *ativacao;
-long long total_celulas;
-
-// Estatísticas 
-int passos_executados = 0;
-long long nao_combustiveis = 0, intactas = 0, em_chamas = 0;
-long long queimadas = 0, contencao = 0, total_ignicoes = 0;
-int pico_ignicoes_passo = -1, pico_ignicoes_qtd = 0;
-double percentual_queimado = 0.0, percentual_protegido = 0.0;
-double tempo_de_execucao = 0.0;
-
+/* ============================================================
+ * prepara_terreno
+ * ============================================================
+ * Aloca a memoria necessaria para todas as matrizes 1D da
+ * simulacao e realiza a geracao pseudoaleatoria deterministica
+ * da cobertura vegetal e umidade de cada celula, segundo as
+ * proporcoes definidas na especificacao.
+ */
 void prepara_terreno(long long L, long long C, unsigned int seed) {
-    total_celulas = L * C; // Tranforma o 2D em uma linha 1D
-    
-    // Aloca a memória da matriz 1D
-    cobertura = malloc(total_celulas * sizeof(unsigned char));
-    umidade = malloc(total_celulas * sizeof(unsigned char));
-    estado_atual = malloc(total_celulas * sizeof(unsigned char));
-    proximo_estado = malloc(total_celulas * sizeof(unsigned char));
-    tempo_atual = malloc(total_celulas * sizeof(int));
-    proximo_tempo = malloc(total_celulas * sizeof(int));
-    ativacao = malloc(total_celulas * sizeof(int));
+    total_celulas = L * C;
 
-    // Geração determinística exigida
+    cobertura = (unsigned char *)malloc(total_celulas * sizeof(unsigned char));
+    umidade = (unsigned char *)malloc(total_celulas * sizeof(unsigned char));
+    estado_atual = (unsigned char *)malloc(total_celulas * sizeof(unsigned char));
+    proximo_estado = (unsigned char *)malloc(total_celulas * sizeof(unsigned char));
+    tempo_atual = (int *)malloc(total_celulas * sizeof(int));
+    proximo_tempo = (int *)malloc(total_celulas * sizeof(int));
+    ativacao = (int *)malloc(total_celulas * sizeof(int));
+
+    if (!cobertura || !umidade || !estado_atual || !proximo_estado ||
+        !tempo_atual || !proximo_tempo || !ativacao) {
+        fprintf(stderr, "Erro: falha na alocacao de memoria para o terreno\n");
+        exit(1);
+    }
+
+    nao_combustiveis = 0;
+
     for (long long i = 0; i < total_celulas; i++) {
         int val_cob = rand_r(&seed) % 100;
-        
-        if (val_cob <= 9) {
-            cobertura[i] = 0; estado_atual[i] = 0; // Água
-            nao_combustiveis++;
 
+        if (val_cob <= 9) {
+            cobertura[i] = 0; estado_atual[i] = 0; // Agua
+            nao_combustiveis++;
         } else if (val_cob <= 19) {
-            cobertura[i] = 1; estado_atual[i] = 0; // Solo
+            cobertura[i] = 1; estado_atual[i] = 0; // Solo exposto
             nao_combustiveis++;
         } else if (val_cob <= 54) {
-            cobertura[i] = 2; estado_atual[i] = 1; // Rasteira
+            cobertura[i] = 2; estado_atual[i] = 1; // Vegetacao rasteira
         } else {
             cobertura[i] = 3; estado_atual[i] = 1; // Floresta
         }
 
-        umidade[i] = rand_r(&seed) % 101;
+        umidade[i] = (unsigned char)(rand_r(&seed) % 101);
         tempo_atual[i] = 0;
         ativacao[i] = -1;
     }
 }
 
+/* ============================================================
+ * gera_relatorio
+ * ============================================================
+ * Calcula o checksum de forma sequencial na ordem linear da matriz
+ * e imprime todos os resultados finais no formato estrito exigido
+ * pela secao 11 da especificacao.
+ */
 void gera_relatorio() {
     unsigned long long checksum = 0;
-    
-    // Cálculo sequencial do checksum final
+
     for (long long i = 0; i < total_celulas; i++) {
         checksum = checksum * 31ULL + (unsigned long long)estado_atual[i];
         checksum = checksum * 31ULL + (unsigned long long)tempo_atual[i];
     }
 
-    // Impressão exigida
     printf("passos: %d\n", passos_executados);
     printf("nao_combustiveis: %lld\n", nao_combustiveis);
     printf("intactas: %lld\n", intactas);
@@ -392,259 +440,383 @@ void gera_relatorio() {
     printf("tempo: %.6f\n", tempo_de_execucao);
 }
 
+/* ============================================================
+ * calcular_peso_basico
+ * ============================================================
+ * Retorna o peso basico de conexao de Moore: 10 para vizinhos
+ * ortogonais (|prop_linha| + |prop_coluna| == 1) e 7 para
+ * vizinhos diagonais.
+ */
+static inline int calcular_peso_basico(int prop_linha, int prop_coluna) {
+    return (abs(prop_linha) + abs(prop_coluna) == 1) ? 10 : 7;
+}
 
-/*
-    As minhas mudanças
+/* ============================================================
+ * calcular_alinhamento_com_vento
+ * ============================================================
+ * Calcula o produto escalar entre o vetor de propagacao (do
+ * vizinho para a celula) e a direcao do vento:
+ * A = prop_linha * vento_linha + prop_coluna * vento_coluna.
+ * Valores variam de -2 (contrario) a +2 (alinhado).
+ */
+static inline int calcular_alinhamento_com_vento(int prop_linha, int prop_coluna,
+                                                int vento_linha, int vento_coluna) {
+    return prop_linha * vento_linha + prop_coluna * vento_coluna;
+}
 
-*/
+/* ============================================================
+ * calcular_peso_do_vizinho
+ * ============================================================
+ * Calcula a contribuicao direcional efetiva de um vizinho:
+ * Pv = max(1, peso_basico + intensidade * alinhamento).
+ */
+static inline int calcular_peso_do_vizinho(int peso_basico,
+                                          int intensidade,
+                                          int alinhamento_com_vento) {
+    int peso = peso_basico + alinhamento_com_vento * intensidade;
+    return (peso > 1) ? peso : 1;
+}
 
-int pesos_vizinhos[3][3];
-
-int ativar_zonas(unsigned char *ativacao, unsigned char *estado_atual, int passo_atual, Config *cfg){
-    for(int z = 0; z<cfg->Z; z++){    
-        const Zona *zona = &cfg->zonas[z];
-        if(zona->passo != passo_atual)
-            continue;
-
-        int L = cfg->L;
-        int C = cfg->C;
-        for(int i = zona->l1; i<= zona->l2; i++){
-            for(int j=zona->c1; j <= zona->c2; j++){
-                int idx = i*C + j;
-                if(passo_atual == ativacao[idx] && ativacao[idx] != -1 && estado_atual[idx] == 1){
-                    estado_atual[idx] = 4;
-                    contencao++;
-                    intactas--;
-                    //printf("zona ativada no passo %d\n", passo_atual);
-                }
+/* ============================================================
+ * calcular_pesos_vizinhos
+ * ============================================================
+ * Pre-computa a matriz estatica 3x3 de pesos direcionais para
+ * todos os deslocamentos de Moore (dl, dc no intervalo [-1, 1]).
+ * A celula central (dl=0, dc=0) recebe peso 0.
+ */
+void calcular_pesos_vizinhos(int vento_linha, int vento_coluna,
+                            int intensidade, int pesos[3][3]) {
+    for (int dl = -1; dl <= 1; dl++) {
+        for (int dc = -1; dc <= 1; dc++) {
+            if (dl == 0 && dc == 0) {
+                pesos[1][1] = 0;
+                continue;
             }
-        }
-    }
-
-    return 0;
-}
-
-static inline int calcular_peso_basico(int prop_linha, int prop_coluna){
-    return abs(prop_linha) + abs(prop_coluna) == 1? 10 : 7;
-}
-
-static inline int calcular_alinhamento_com_vento(int prop_linha, int prop_coluna, int vento_linha, int vento_coluna){
-    return prop_linha*vento_linha + prop_coluna*vento_coluna;
-}
-
-static inline int calcular_peso_do_vizinho(int peso_basico, 
-                                    int intensidade, 
-                                    int alinhamento_com_vento)
-{
-    int peso_do_vizinho = peso_basico 
-                        + alinhamento_com_vento*intensidade;
-
-    return 1 > peso_do_vizinho ? 1 : peso_do_vizinho;
-}
-
-void calcular_pesos_vizinhos(int vento_linha, int vento_coluna, int intensidade, int pesos_vizinhos[3][3]){
-
-    for(int dl=-1; dl<2;dl++){
-        for(int dc=-1; dc<2;dc++){
             const int prop_linha = -dl;
             const int prop_coluna = -dc;
             const int peso_basico = calcular_peso_basico(prop_linha, prop_coluna);
-            const int A = calcular_alinhamento_com_vento(prop_linha, prop_coluna, vento_linha, vento_coluna);
-            const int pv = calcular_peso_do_vizinho(peso_basico, intensidade, A);
-
-            pesos_vizinhos[dl + 1][dc + 1] = pv > 1 ? pv:1;
+            const int A = calcular_alinhamento_com_vento(prop_linha, prop_coluna,
+                                                        vento_linha, vento_coluna);
+            pesos[dl + 1][dc + 1] = calcular_peso_do_vizinho(peso_basico, intensidade, A);
         }
     }
-
-    pesos_vizinhos[1][1] = 0; //a propria celula nao é vizinha
 }
 
-static inline int calcular_potencial_de_ignicao(int s, int fator_combustivel, int umidade){
-    return (s*fator_combustivel*(100-umidade)) / 100;
-}
-
-void transicao(int estado, int tempo, int cob, int umidade, int S, int limiar, int *novo_estado, int *novo_tempo){
-    int fator_combustivel = 8*(cob == 2) + 12*(cob==3);
-    int potencial = S * fator_combustivel * (100-umidade) / 100;
+/* ============================================================
+ * transicao
+ * ============================================================
+ * Implementa a logica branchless de transicao de estados e tempos
+ * de queima de uma celula a partir de seu estado atual, cobertura,
+ * umidade, soma dos pesos dos vizinhos em chamas (S) e limiar.
+ */
+static inline void transicao(int estado, int tempo, int cob, int umid,
+                            int S, int limiar,
+                            int *novo_estado, int *novo_tempo) {
+    int fator_combustivel = 8 * (cob == 2) + 12 * (cob == 3);
+    int potencial = (S * fator_combustivel * (100 - umid)) / 100;
     int ignicao = (potencial >= limiar) & (estado == 1);
     int queimando = (estado == 2);
     int apagou = queimando & (tempo == 1);
 
     *novo_estado = estado + ignicao + apagou;
-    *novo_tempo = tempo - queimando + ignicao *(2 + 2*(cob==3));
+    *novo_tempo = tempo - queimando + ignicao * (2 + 2 * (cob == 3));
 }
 
-void atualizar_celula_borda(int i, int j, int L, int C, int limiar,
-                            const unsigned char *estado_atual, const unsigned char *tempo_atual,
-                            const unsigned char *cobertura, const unsigned char *umidade,
-                            unsigned char *proximo_estado, unsigned char *proximo_tempo,
-                            long long *ignicoes, long long *apagadas
-                            )
-{
-    long long idx = (long long) i * C + j;
-    int s = 0, novo_estado, novo_tempo;
+/* ============================================================
+ * atualizar_celula_borda
+ * ============================================================
+ * Atualiza uma celula localizada na borda da grade com verificacao
+ * de limites de coordenadas nos 8 vizinhos de Moore. Acumula novas
+ * ignicoes e celulas que apagaram nos contadores passados por referencia.
+ */
+static inline void atualizar_celula_borda(int i, int j, int L, int C, int limiar,
+                                         const unsigned char *restrict estado_arr,
+                                         const int *restrict tempo_arr,
+                                         const unsigned char *restrict cob_arr,
+                                         const unsigned char *restrict umid_arr,
+                                         unsigned char *restrict prox_estado,
+                                         int *restrict prox_tempo,
+                                         long long *restrict ignicoes,
+                                         long long *restrict apagadas) {
+    long long idx = (long long)i * C + j;
+    int s = 0, n_estado, n_tempo;
 
-    for(int dl = -1; dl <=1 ; dl++){
-        for(int dc=-1; dc <=1; dc++){
-            int lv = i+dl, cv=j+dc;
-            if(lv >= 0 && lv < L && cv >= 0 && cv < C && estado_atual[(long long)lv*C + cv] == 2)
-                s += pesos_vizinhos[dl+1][dc+1];
-        }
-    }
-
-    transicao(estado_atual[idx], tempo_atual[idx], cobertura[idx], umidade[idx], s, limiar, &novo_estado, &novo_tempo);
-    proximo_estado[idx] = novo_estado;
-    proximo_tempo[idx] = novo_tempo;
-    *ignicoes += (estado_atual[idx] == 1) & (proximo_estado[idx] == 2);
-    *apagadas += (estado_atual[idx] == 2) & (proximo_estado[idx] == 3);
-
-}
-
-void calcular_proximo_estado(int L, int C, 
-                            int vento_linha, int vento_coluna, 
-                            int intensidade,
-
-                            const unsigned char *restrict estado_atual, const unsigned char *restrict tempo_atual,
-                            const unsigned char *restrict cobertura, const unsigned char *restrict umidade,
-                            unsigned char *restrict proximo_estado, unsigned char *restrict proximo_tempo,
-
-                            long long *ignicoes, long long *apagadas, int limiar
-){
-
-    long long ign = 0, apag = 0;
-    const int p_no = pesos_vizinhos[0][0], p_n = pesos_vizinhos[0][1], p_ne = pesos_vizinhos[0][2];
-    const int p_o = pesos_vizinhos[1][0],                                p_e = pesos_vizinhos[1][2];
-    const int p_so = pesos_vizinhos[2][0], p_s = pesos_vizinhos[2][1], p_se = pesos_vizinhos[2][2]; 
-    #pragma omp parallel for schedule(static) reduction(+:ign, apag)
-    for(int i = 0; i < L; i++){
-
-        if( i==0 || i== L-1){
-            for(int j=0; j<C; j++){
-                atualizar_celula_borda(i, j, L, C, limiar, estado_atual, tempo_atual, cobertura, umidade, proximo_estado, proximo_tempo, &ign, &apag);
+    for (int dl = -1; dl <= 1; dl++) {
+        for (int dc = -1; dc <= 1; dc++) {
+            if (dl == 0 && dc == 0) continue;
+            int lv = i + dl;
+            int cv = j + dc;
+            if (lv >= 0 && lv < L && cv >= 0 && cv < C) {
+                if (estado_arr[(long long)lv * C + cv] == 2) {
+                    s += pesos_vizinhos[dl + 1][dc + 1];
+                }
             }
-            continue;
         }
-
-        atualizar_celula_borda(i, 0, L, C, limiar, estado_atual, tempo_atual, cobertura, umidade, proximo_estado, proximo_tempo, &ign, &apag);
-        if(C > 1)
-            atualizar_celula_borda(i, C-1, L, C, limiar, estado_atual, tempo_atual, cobertura, umidade, proximo_estado, proximo_tempo, &ign, &apag);
-        
-        const long long base = (long long) i*C;
-        const unsigned char *acima = estado_atual+base - C;
-        const unsigned char *meio  = estado_atual+base;
-        const unsigned char *abaixo = estado_atual + base + C;
-        int ign_linha = 0, apag_linha = 0;
-        #pragma omp simd reduction(+:ign_linha, apag_linha)
-        for(int j = 1; j < C-1; j++){
-
-            const int s = p_no * (acima[j - 1] == 2)  + p_n * (acima[j] == 2)  + p_ne * (acima[j + 1] == 2)
-                        + p_o  * (meio[j - 1] == 2)                            + p_e  * (meio[j + 1] == 2)
-                        + p_so * (abaixo[j - 1] == 2) + p_s * (abaixo[j] == 2) + p_se * (abaixo[j + 1] == 2);
-            int novo_estado, novo_tempo;
-            
-            transicao(meio[j], tempo_atual[base + j], cobertura[base + j], umidade[base + j], s, limiar, &novo_estado, &novo_tempo);
-            proximo_estado[base + j] = novo_estado;
-            proximo_tempo[base + j] = novo_tempo;
-            ign_linha += (meio[j] == 1) & (novo_estado == 2);
-            apag_linha += (meio[j] == 2) & (novo_estado == 3);
-        }
-        ign += ign_linha;
-        apag += apag_linha;
     }
-    *ignicoes = ign;
-    *apagadas = apag;
+
+    transicao(estado_arr[idx], tempo_arr[idx], cob_arr[idx], umid_arr[idx],
+              s, limiar, &n_estado, &n_tempo);
+    prox_estado[idx] = (unsigned char)n_estado;
+    prox_tempo[idx] = n_tempo;
+    *ignicoes += (estado_arr[idx] == 1) & (n_estado == 2);
+    *apagadas += (estado_arr[idx] == 2) & (n_estado == 3);
 }
 
-
-
-
+/* ============================================================
+ * main
+ * ============================================================
+ * Nucleo principal do programa. Carrega a configuracao, aloca
+ * matrizes, aplica focos, prepara o mapa de ativacao e executa
+ * a simulacao em paralelo utilizando uma regiao OpenMP persistente
+ * com clausula default(none) e reducoes nos contadores.
+ */
 int main(int argc, char *argv[]) {
-    
-    // [FRENTE 1]: Lógica de abrir arquivo e validar argumentos entra aqui.
-    
-    // Valores "mockados" só para testar se o código funciona.
-    //long long L = 2500, C = 2500; 
-    //unsigned int seed = 2027;
-    Config cfg;
-    if(argc != 2){
-        printf("Incorrect number of arguments");
+    if (argc != 2) {
+        fprintf(stderr, "Uso: %s <arquivo_entrada>\n", argv[0]);
         return 1;
     }
-    const char* entrada = argv[1]; 
-    
-    le_entrada(entrada, &cfg);
+
+    Config cfg;
+    if (le_entrada(argv[1], &cfg) != 0) {
+        return 1;
+    }
+
     omp_set_num_threads(cfg.T);
 
-    intactas = cfg.L*cfg.C;
     prepara_terreno(cfg.L, cfg.C, cfg.seed);
-    aplica_focos(&cfg, cfg.C, cobertura, estado_atual, tempo_atual);
-    em_chamas = cfg.F;
-    intactas-= cfg.F + nao_combustiveis;
-    int combustiveis_iniciais = intactas;
+
+    if (aplica_focos(&cfg, cfg.C, cobertura, estado_atual, tempo_atual) != 0) {
+        libera_config(&cfg);
+        free(cobertura);
+        free(umidade);
+        free(estado_atual);
+        free(proximo_estado);
+        free(tempo_atual);
+        free(proximo_tempo);
+        free(ativacao);
+        return 1;
+    }
+
     constroi_mapa_ativacao(&cfg, cfg.C, ativacao);
 
-    // Espaço para verificar focos:
-    for(int i = 0; i < cfg.L; i++){
-        for(int j = 0; j < cfg.C; j++){
-            int idx = i*cfg.C + j;
-            //printf("%d\n", ativacao[idx]);
-            if(estado_atual[idx] == 2){
-                printf("Foco: %d, %d\n", i, j);
+    /* Calculo exato das celulas combustiveis iniciais (Rasteira + Floresta) */
+    long long combustiveis_iniciais = total_celulas - nao_combustiveis;
+    em_chamas = cfg.F;
+    intactas = combustiveis_iniciais - cfg.F;
+    queimadas = 0;
+    contencao = 0;
+    total_ignicoes = 0;
+    pico_ignicoes_passo = -1;
+    pico_ignicoes_qtd = 0;
+    passos_executados = 0;
+
+    /* Pre-computacao dos pesos direcionais constantes do vento */
+    calcular_pesos_vizinhos(cfg.vento_linha, cfg.vento_coluna,
+                            cfg.intensidade_vento, pesos_vizinhos);
+
+    const int p_no = pesos_vizinhos[0][0], p_n = pesos_vizinhos[0][1], p_ne = pesos_vizinhos[0][2];
+    const int p_o  = pesos_vizinhos[1][0],                              p_e  = pesos_vizinhos[1][2];
+    const int p_so = pesos_vizinhos[2][0], p_s = pesos_vizinhos[2][1], p_se = pesos_vizinhos[2][2];
+
+    const int L = cfg.L;
+    const int C = cfg.C;
+    const int P = cfg.P;
+    const int limiar = cfg.LIMIAR;
+    const int Z = cfg.Z;
+    const Zona *zonas = cfg.zonas;
+
+    int fim_simulacao = (em_chamas <= 0 || P == 0);
+    long long step_contencoes = 0;
+    long long step_ignicoes = 0;
+    long long step_apagadas = 0;
+
+    /* ============================================================
+     * Trecho Cronometrado da Simulacao (Secao 12 do PDF)
+     * ============================================================ */
+    double inicio = omp_get_wtime();
+
+    /* Regiao paralela persistente: a equipe de threads e criada uma unica
+     * vez antes do loop temporal, eliminando o overhead de criacao e destruicao
+     * de threads a cada passo da simulacao. */
+    #pragma omp parallel num_threads(cfg.T) default(none) \
+        shared(L, C, P, limiar, Z, zonas, ativacao, \
+               estado_atual, proximo_estado, tempo_atual, proximo_tempo, \
+               cobertura, umidade, pesos_vizinhos, \
+               p_no, p_n, p_ne, p_o, p_e, p_so, p_s, p_se, \
+               passos_executados, em_chamas, intactas, queimadas, \
+               contencao, total_ignicoes, pico_ignicoes_passo, pico_ignicoes_qtd, \
+               fim_simulacao, step_contencoes, step_ignicoes, step_apagadas)
+    {
+        while (!fim_simulacao) {
+            #pragma omp single
+            {
+                step_contencoes = 0;
+                step_ignicoes = 0;
+                step_apagadas = 0;
             }
+
+            /* 1. Ativacao paralela das zonas de contencao programadas */
+            for (int z = 0; z < Z; z++) {
+                if (zonas[z].passo == passos_executados) {
+                    const int l1 = zonas[z].l1, l2 = zonas[z].l2;
+                    const int c1 = zonas[z].c1, c2 = zonas[z].c2;
+
+                    #pragma omp for schedule(static) reduction(+:step_contencoes)
+                    for (int i = l1; i <= l2; i++) {
+                        for (int j = c1; j <= c2; j++) {
+                            long long idx = (long long)i * C + j;
+                            if (ativacao[idx] == passos_executados && estado_atual[idx] == 1) {
+                                estado_atual[idx] = 4;
+                                step_contencoes++;
+                            }
+                        }
+                    }
+                }
+            }
+
+            /* 2. Propagacao do fogo e atualizacao das celulas */
+            #pragma omp for schedule(SCHEDULE_OMP) reduction(+:step_ignicoes, step_apagadas)
+            for (int i = 0; i < L; i++) {
+                if (i == 0 || i == L - 1) {
+                    for (int j = 0; j < C; j++) {
+                        atualizar_celula_borda(i, j, L, C, limiar,
+                                               estado_atual, tempo_atual,
+                                               cobertura, umidade,
+                                               proximo_estado, proximo_tempo,
+                                               &step_ignicoes, &step_apagadas);
+                    }
+                    continue;
+                }
+
+                /* Celulas da borda esquerda e direita */
+                atualizar_celula_borda(i, 0, L, C, limiar,
+                                       estado_atual, tempo_atual,
+                                       cobertura, umidade,
+                                       proximo_estado, proximo_tempo,
+                                       &step_ignicoes, &step_apagadas);
+                if (C > 1) {
+                    atualizar_celula_borda(i, C - 1, L, C, limiar,
+                                           estado_atual, tempo_atual,
+                                           cobertura, umidade,
+                                           proximo_estado, proximo_tempo,
+                                           &step_ignicoes, &step_apagadas);
+                }
+
+                const long long base = (long long)i * C;
+
+                /*
+                 * Hot path: keep each row as a set of independent streams.
+                 * This avoids repeatedly forming base+j addresses and makes
+                 * the memory access pattern explicit to the compiler.
+                 *
+                 * restrict is valid here because these arrays are distinct
+                 * allocations and the current/next buffers do not alias.
+                 */
+                const unsigned char *acima = estado_atual + base - C;
+                const unsigned char *meio  = estado_atual + base;
+                const unsigned char *abaixo = estado_atual + base + C;
+
+                const int *restrict tempo = tempo_atual + base;
+                const unsigned char *restrict cob = cobertura + base;
+                const unsigned char *restrict umid = umidade + base;
+
+                unsigned char *restrict prox_e = proximo_estado + base;
+                int *restrict prox_t = proximo_tempo + base;
+
+                int ign_linha = 0, apag_linha = 0;
+
+                /* Celulas internas sem checagem de bordas: vetorizacao SIMD */
+                #pragma omp simd reduction(+:ign_linha, apag_linha)
+                for (int j = 1; j < C - 1; j++) {
+                    const int s = p_no * (acima[j - 1] == 2)  + p_n * (acima[j] == 2)  + p_ne * (acima[j + 1] == 2)
+                                + p_o  * (meio[j - 1] == 2)                            + p_e  * (meio[j + 1] == 2)
+                                + p_so * (abaixo[j - 1] == 2) + p_s * (abaixo[j] == 2) + p_se * (abaixo[j + 1] == 2);
+
+                    /*
+                     * Inline the transition in the SIMD kernel. This is
+                     * algebraically identical to transicao(), but exposes
+                     * the complete hot loop to the vectorizer.
+                     */
+                    const int estado = meio[j];
+                    const int tempo_j = tempo[j];
+                    const int cob_j = cob[j];
+                    const int umid_j = umid[j];
+
+                    const int fator_combustivel =
+                        8 * (cob_j == 2) + 12 * (cob_j == 3);
+                    const int potencial =
+                        (s * fator_combustivel * (100 - umid_j)) / 100;
+                    const int ignicao =
+                        (potencial >= limiar) & (estado == 1);
+                    const int queimando = (estado == 2);
+                    const int apagou = queimando & (tempo_j == 1);
+
+                    const int novo_estado =
+                        estado + ignicao + apagou;
+                    const int novo_tempo =
+                        tempo_j - queimando +
+                        ignicao * (2 + 2 * (cob_j == 3));
+
+                    prox_e[j] = (unsigned char)novo_estado;
+                    prox_t[j] = novo_tempo;
+
+                    ign_linha += (estado == 1) & (novo_estado == 2);
+                    apag_linha += (estado == 2) & (novo_estado == 3);
+                }
+
+                step_ignicoes += ign_linha;
+                step_apagadas += apag_linha;
+            }
+
+            /* 3. Atualizacao atomica/segura das estatisticas e double-buffering */
+            #pragma omp single
+            {
+                contencao += step_contencoes;
+                intactas -= (step_contencoes + step_ignicoes);
+                em_chamas += (step_ignicoes - step_apagadas);
+                queimadas += step_apagadas;
+                total_ignicoes += step_ignicoes;
+
+                if (step_ignicoes > pico_ignicoes_qtd) {
+                    pico_ignicoes_qtd = (int)step_ignicoes;
+                    pico_ignicoes_passo = passos_executados;
+                }
+
+                passos_executados++;
+
+                /* Troca de ponteiros das matrizes (double-buffering seguro) */
+                unsigned char *tmp_e = estado_atual;
+                estado_atual = proximo_estado;
+                proximo_estado = tmp_e;
+
+                int *tmp_t = tempo_atual;
+                tempo_atual = proximo_tempo;
+                proximo_tempo = tmp_t;
+
+                /* Verificacao da condicao de parada */
+                if (em_chamas <= 0 || passos_executados >= P) {
+                    fim_simulacao = 1;
+                }
+            } /* Barreira implicita no final do bloco single garante que
+               * todas as threads visualizem os novos ponteiros e o fim_simulacao */
         }
     }
 
-    // [ESPAÇO DA FRENTE 1 e 2]: Lógica de marcar os focos de incêndio e zonas de contenção.
+    tempo_de_execucao = omp_get_wtime() - inicio;
 
-    double inicio = omp_get_wtime(); // Liga o cronômetro
-    calcular_pesos_vizinhos(cfg.vento_linha, cfg.vento_coluna, cfg.intensidade_vento, pesos_vizinhos);
-    //for(int passo = 0; passo < cfg.P; passo++){
-    //    ativar_zonas(ativacao, estado_atual, passo, cfg.L, cfg.C);
-    //}
-
-    while(em_chamas > 0 && passos_executados < cfg.P){
-        ativar_zonas(ativacao, estado_atual, passos_executados, &cfg);
-
-        long long ignicoes, apagadas;
-        calcular_proximo_estado(cfg.L, cfg.C,
-                                cfg.vento_linha, cfg.vento_coluna,
-                                cfg.intensidade_vento,
-                                estado_atual, tempo_atual, cobertura, umidade,
-                                proximo_estado, proximo_tempo, &ignicoes, &apagadas,
-                                cfg.LIMIAR
-        );
-        em_chamas += ignicoes - apagadas;
-        intactas -= ignicoes;
-        queimadas += apagadas;
-        total_ignicoes += ignicoes;
-        if(ignicoes > pico_ignicoes_qtd){
-            pico_ignicoes_qtd = ignicoes;
-            pico_ignicoes_passo = passos_executados;
-        }
-        passos_executados++;
-        
-        unsigned char *estado_temporario;
-        estado_temporario = estado_atual;
-        estado_atual = proximo_estado;
-        proximo_estado = estado_temporario;
-
-        unsigned char *tempo_temporario;
-        tempo_temporario = tempo_atual;
-        tempo_atual = proximo_tempo;
-        proximo_tempo = tempo_temporario;
-        
+    /* Calculo de percentuais com prevencao de divisao por zero */
+    if (combustiveis_iniciais > 0) {
+        percentual_queimado = (100.0 * (double)(queimadas + em_chamas)) / (double)combustiveis_iniciais;
+        percentual_protegido = (100.0 * (double)contencao) / (double)combustiveis_iniciais;
+    } else {
+        percentual_queimado = 0.0;
+        percentual_protegido = 0.0;
     }
-    
-    // [ESPAÇO DA FRENTE 3]: O for de tempo e simulação do fogo fica rodando aqui dentro.
-    
-    tempo_de_execucao = omp_get_wtime() - inicio; // Desliga cronômetro
-    libera_config(&cfg);
 
-    percentual_queimado = (double) 100*(queimadas + em_chamas) / combustiveis_iniciais;
-    percentual_protegido = (double) 100* contencao / (combustiveis_iniciais);
     gera_relatorio();
 
-    // Limpeza da memória alocada dinamicamente
+    /* Liberacao de recursos */
+    libera_config(&cfg);
     free(cobertura);
     free(umidade);
     free(estado_atual);
@@ -652,6 +824,6 @@ int main(int argc, char *argv[]) {
     free(tempo_atual);
     free(proximo_tempo);
     free(ativacao);
-    
+
     return 0;
 }
