@@ -705,12 +705,12 @@ int main(int argc, char *argv[]) {
                 const long long base = (long long)i * C;
 
                 /*
-                 * Hot path: keep each row as a set of independent streams.
-                 * This avoids repeatedly forming base+j addresses and makes
-                 * the memory access pattern explicit to the compiler.
+                 * Mantendo cada linha como um conjunto independente de streams
+                 * se evita repetidamente re estimar os enderecos base+j, fazendo
+                 * o padrao de acesso a memoria explicito pro compilador.
                  *
-                 * restrict is valid here because these arrays are distinct
-                 * allocations and the current/next buffers do not alias.
+                 * restric e valido aqui pois esses vetores sao alocacoes distintas
+                 * e os buffers atual/proximo nao tem aliasing
                  */
                 const unsigned char *acima = estado_atual + base - C;
                 const unsigned char *meio  = estado_atual + base;
@@ -733,9 +733,8 @@ int main(int argc, char *argv[]) {
                                 + p_so * (abaixo[j - 1] == 2) + p_s * (abaixo[j] == 2) + p_se * (abaixo[j + 1] == 2);
 
                     /*
-                     * Inline the transition in the SIMD kernel. This is
-                     * algebraically identical to transicao(), but exposes
-                     * the complete hot loop to the vectorizer.
+                     * Usar inline para a transicao na parte SIMD. Isso expoe
+                     * completamente o loop para a vetorizacao pelo compilador.
                      */
                     const int estado = meio[j];
                     const int tempo_j = tempo[j];
